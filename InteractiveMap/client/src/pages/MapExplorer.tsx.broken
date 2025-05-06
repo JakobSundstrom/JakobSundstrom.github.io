@@ -1,0 +1,757 @@
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import "leaflet/dist/leaflet.css";
+import L from "leaflet";
+import { locationData, Location } from "@/lib/sampleData";
+
+// Game states
+type GameState = 'idle' | 'playing' | 'finished';
+
+const MapExplorer: React.FC = () => {
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const markersRef = useRef<{ [key: number]: L.Marker }>({});
+  const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
+  
+  // Game state
+  const [gameState, setGameState] = useState<GameState>('idle');
+  const [score, setScore] = useState(0);
+  const [timer, setTimer] = useState(0);
+  const [currentTarget, setCurrentTarget] = useState<Location | null>(null);
+  const [foundLocations, setFoundLocations] = useState<number[]>([]);
+  const [incorrectAttempts, setIncorrectAttempts] = useState(0);
+  const [gameStats, setGameStats] = useState<{
+    totalCorrect: number;
+    totalAttempts: number;
+    timeElapsed: number;
+    percentage: number;
+    message: string;
+  } | null>(null);
+  
+  // Create refs for timer
+  const timerRef = useRef<number | null>(null);
+  const timerStartRef = useRef<number | null>(null);
+  const timerDisplayRef = useRef<HTMLSpanElement | null>(null);
+  const secondsElapsedRef = useRef<number>(0);
+  
+  // Create refs for UI updates
+  const scoreRef = useRef<HTMLSpanElement | null>(null);
+  const foundCountRef = useRef<HTMLSpanElement | null>(null);
+  const targetNameRef = useRef<HTMLDivElement | null>(null);
+  const targetColorRef = useRef<string>('#F59E0B'); // Default to mine color
+  
+  // Refs for game state tracking
+  const scoreValueRef = useRef<number>(0);
+  const incorrectAttemptsValueRef = useRef<number>(0);
+  const foundLocationsRef = useRef<number[]>([]);
+  const currentTargetRef = useRef<Location | null>(null);
+  
+  // Function to create icon with different styles (normal, correct, incorrect)
+  const createIcon = useCallback((category: 'mine' | 'smelter', correct: boolean = false, incorrect: boolean = false) => {
+    const backgroundColor = correct 
+      ? '#22C55E' // Green for correct
+      : incorrect 
+        ? '#EF4444' // Red for incorrect
+        : category === 'mine' 
+          ? '#F59E0B' // Yellow for mine
+          : '#3B82F6'; // Blue for smelter
+    
+    return L.divIcon({
+      html: `
+        <div style="position: relative;">
+          <div style="
+            width: 24px;
+            height: 24px;
+            background-color: ${backgroundColor};
+            border: 2px solid #333;
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+          ">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              ${category === 'mine' 
+                ? `<path d="M2 3h20"/>
+                   <path d="M21 6v6a6 6 0 0 1-6 6H9a6 6 0 0 1-6-6V6"/>
+                   <path d="M12 10v6"/>
+                   <path d="M12 3v3"/>`
+                : `<path d="M2 12h2"/>
+                   <path d="M6 12h2"/>
+                   <path d="M10 12h2"/>
+                   <path d="M22 12h-4"/>
+                   <path d="M6 8h.01"/>
+                   <path d="M10 8h.01"/>
+                   <path d="M14 8h.01"/>
+                   <path d="M18 8h.01"/>
+                   <rect x="2" y="18" width="20" height="4" rx="1"/>
+                   <path d="M4 15v3"/>
+                   <path d="M8 15v3"/>
+                   <path d="M12 15v3"/>
+                   <path d="M16 15v3"/>
+                   <path d="M20 15v3"/>
+                   <path d="M4 8a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v4H4V8Z"/>`
+              }
+            </svg>
+          </div>
+        </div>
+      `,
+      className: '',
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    });
+  }, []);
+  
+  // Format time for display without re-rendering
+  const formatTimeInternal = (seconds: number) => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+  
+  // Update timer display directly in DOM to avoid re-rendering
+  const updateTimerDisplay = () => {
+    if (timerDisplayRef.current && timerStartRef.current) {
+      const secondsElapsed = Math.floor((Date.now() - timerStartRef.current) / 1000);
+      secondsElapsedRef.current = secondsElapsed; // Store for stats later
+      timerDisplayRef.current.textContent = formatTimeInternal(secondsElapsed);
+    }
+  };
+  
+  // Update score display directly in the DOM
+  const updateScoreDisplay = (newScore: number) => {
+    scoreValueRef.current = newScore;
+    if (scoreRef.current) {
+      scoreRef.current.textContent = newScore.toString();
+    }
+  };
+  
+  // Update found count display directly in the DOM
+  const updateFoundDisplay = (foundIds: number[]) => {
+    foundLocationsRef.current = foundIds;
+    if (foundCountRef.current) {
+      foundCountRef.current.textContent = `${foundIds.length}/${locationData.length}`;
+    }
+  };
+  
+  // Set next target without re-rendering
+  const updateTargetDisplay = (target: Location) => {
+    currentTargetRef.current = target;
+    
+    if (targetNameRef.current) {
+      targetNameRef.current.textContent = target.title;
+      
+      // Set the target color
+      const color = target.category === 'mine' ? '#F59E0B' : '#3B82F6';
+      targetColorRef.current = color;
+      targetNameRef.current.style.color = color;
+    }
+  };
+  
+  // End the game function
+  const endGame = useCallback(() => {
+    // No need to clear timer here as useEffect handles it
+    
+    // Calculate stats
+    const totalLocations = locationData.length;
+    const foundCount = foundLocations.length;
+    const totalAttempts = foundCount + incorrectAttempts;
+    const percentage = Math.round((foundCount / totalLocations) * 100);
+    
+    // Determine message based on percentage
+    let message = "";
+    if (percentage >= 90) {
+      message = "Excellent! You know Boliden operations well!";
+    } else if (percentage >= 70) {
+      message = "Great job! You're getting familiar with Boliden locations.";
+    } else if (percentage >= 50) {
+      message = "Good effort! Try again to improve your score.";
+    } else {
+      message = "Keep practicing to learn the Boliden operations!";
+    }
+    
+    // Set game stats, using the ref value instead of state
+    setGameStats({
+      totalCorrect: foundCount,
+      totalAttempts,
+      timeElapsed: secondsElapsedRef.current,
+      percentage,
+      message
+    });
+    
+    // Update game state
+    setGameState('finished');
+    setCurrentTarget(null);
+  }, [foundLocations.length, incorrectAttempts]);
+  
+  // Function to shuffle and pick a random location
+  const getRandomLocation = useCallback(() => {
+    // Filter out locations that have already been found
+    const remainingLocations = locationData.filter(loc => !foundLocationsRef.current.includes(loc.id));
+    
+    // If no locations remain, end the game
+    if (remainingLocations.length === 0) {
+      endGame();
+      return null;
+    }
+    
+    // Pick a random location from remaining ones
+    const randomIndex = Math.floor(Math.random() * remainingLocations.length);
+    return remainingLocations[randomIndex];
+  }, [endGame]);
+  
+  // Start the game
+  const startGame = useCallback(() => {
+    // Reset game state - we still need some state updates
+    setGameState('playing');
+    setGameStats(null);
+    
+    // Reset all our ref values
+    scoreValueRef.current = 0;
+    incorrectAttemptsValueRef.current = 0;
+    foundLocationsRef.current = [];
+    
+    // Get the first target
+    const firstTarget = getRandomLocation();
+    if (!firstTarget) return; // Safety check
+    
+    // Instead of using state, wait for DOM to be ready and update directly
+    setTimeout(() => {
+      // Update score display
+      if (scoreRef.current) {
+        scoreRef.current.textContent = "0";
+      }
+      
+      // Update found display
+      if (foundCountRef.current) {
+        foundCountRef.current.textContent = `0/${locationData.length}`;
+      }
+      
+      // Update target display
+      if (targetNameRef.current) {
+        targetNameRef.current.textContent = firstTarget.title;
+        
+        // Set the target color
+        const color = firstTarget.category === 'mine' ? '#F59E0B' : '#3B82F6';
+        targetColorRef.current = color;
+        targetNameRef.current.style.color = color;
+      }
+      
+      // Store the current target in ref
+      currentTargetRef.current = firstTarget;
+    }, 0);
+    
+    // We still update the state for initial render of game UI
+    setScore(0);
+    setTimer(0);
+    setFoundLocations([]);
+    setIncorrectAttempts(0);
+    setCurrentTarget(firstTarget);
+  }, [getRandomLocation]);
+  
+  // Handle location click during game - optimized to avoid re-renders
+  const handleLocationClick = useCallback((location: Location) => {
+    if (gameState !== 'playing' || !currentTargetRef.current) return;
+    
+    // Check if correct location was clicked
+    if (location.id === currentTargetRef.current.id) {
+      // Correct answer - update score without state change
+      const newScore = scoreValueRef.current + 1;
+      updateScoreDisplay(newScore);
+      
+      // Flash green to indicate correct choice
+      const marker = markersRef.current[location.id];
+      if (marker) {
+        const icon = marker.getIcon();
+        marker.setIcon(createIcon(location.category, true));
+        setTimeout(() => {
+          marker.setIcon(icon);
+        }, 500);
+      }
+      
+      // Track this location as found without state change
+      const updatedFoundLocations = [...foundLocationsRef.current, location.id];
+      updateFoundDisplay(updatedFoundLocations);
+      
+      // Check if all locations found
+      if (updatedFoundLocations.length >= locationData.length) {
+        // For end game, we need to sync state before calling endGame
+        setFoundLocations(updatedFoundLocations);
+        setScore(newScore);
+        setIncorrectAttempts(incorrectAttemptsValueRef.current);
+        endGame();
+      } else {
+        // Set next target without re-rendering
+        const remainingLocations = locationData.filter(loc => !updatedFoundLocations.includes(loc.id));
+        const nextTarget = remainingLocations[Math.floor(Math.random() * remainingLocations.length)];
+        updateTargetDisplay(nextTarget);
+      }
+    } else {
+      // Incorrect answer - update score without state change
+      const newScore = Math.max(scoreValueRef.current - 1, -10);
+      updateScoreDisplay(newScore);
+      
+      // Track incorrect attempts 
+      incorrectAttemptsValueRef.current += 1;
+      
+      // Flash red to indicate wrong choice
+      const marker = markersRef.current[location.id];
+      if (marker) {
+        const icon = marker.getIcon();
+        marker.setIcon(createIcon(location.category, false, true));
+        setTimeout(() => {
+          marker.setIcon(icon);
+        }, 500);
+      }
+      
+      // Check if reached -10 points
+      if (newScore <= -10) {
+        // For end game, we need to sync state before calling endGame
+        setFoundLocations(foundLocationsRef.current);
+        setScore(newScore);
+        setIncorrectAttempts(incorrectAttemptsValueRef.current);
+        endGame();
+      }
+    }
+  }, [gameState, endGame, createIcon]);
+
+  // Basic timer implementation using DOM manipulation to prevent re-renders
+  useEffect(() => {
+    if (gameState === 'playing') {
+      // Reset timer on game start
+      timerStartRef.current = Date.now();
+      secondsElapsedRef.current = 0;
+      
+      // Start timer - update DOM directly without state updates
+      timerRef.current = window.setInterval(updateTimerDisplay, 1000);
+      
+      // Immediately set initial value
+      updateTimerDisplay();
+      
+      // Cleanup when component unmounts or game state changes
+      return () => {
+        if (timerRef.current) {
+          window.clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+      };
+    }
+  }, [gameState]); // Only depend on gameState changes
+  
+  // Format time for display
+  const formatTime = (seconds: number) => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+  
+  // Initialize the map on component mount
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+    
+    // Create the map instance with simplified controls
+    const map = L.map(mapContainerRef.current, {
+      center: [55, 10], // Center adjusted to show all operations
+      zoom: 3.5,
+      zoomControl: false, // Hide default zoom control
+      attributionControl: false, // Hide attribution initially
+      scrollWheelZoom: true
+    });
+    
+    mapRef.current = map;
+    
+    // Add custom Seterra-like map style using Carto positron for a clean, minimal look
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      subdomains: 'abcd',
+      minZoom: 1,
+      maxZoom: 19
+    }).addTo(map);
+    
+    // Add country borders with Seterra-like styling
+    fetch('https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson')
+      .then(response => response.json())
+      .then(data => {
+        // Filter for northern Europe
+        const northernEurope = ["Sweden", "Finland", "Norway", "Denmark", "Ireland", "Portugal"];
+        const filteredFeatures = data.features.filter((feature: any) => 
+          northernEurope.includes(feature.properties.ADMIN)
+        );
+        
+        // Create a new GeoJSON with only northern European countries
+        const northernEuropeGeoJSON = {
+          type: "FeatureCollection" as const,
+          features: filteredFeatures
+        };
+        
+        // Add the filtered GeoJSON to the map
+        L.geoJSON(northernEuropeGeoJSON as any, {
+          style: (feature) => {
+            // Different colors for different countries
+            let fillColor = "#e0f0ff"; // Default light blue
+            
+            if (feature?.properties.ADMIN === "Sweden") {
+              fillColor = "#C3DFFF"; // Light blue for Sweden
+            } else if (feature?.properties.ADMIN === "Finland") {
+              fillColor = "#D4E6FF"; // Slightly different blue for Finland
+            } else if (feature?.properties.ADMIN === "Norway") {
+              fillColor = "#E4EFFF"; // Another shade for Norway
+            }
+            
+            return {
+              color: "#336699", // Darker blue outline like Seterra
+              weight: 1.5,      // Slightly thicker border
+              opacity: 1,       // Fully opaque borders
+              fillOpacity: 0.25, // Light fill
+              fillColor: fillColor
+            };
+          }
+        }).addTo(map);
+        
+        // Add other world countries with lighter styling
+        L.geoJSON(data, {
+          filter: (feature) => !northernEurope.includes(feature.properties.ADMIN),
+          style: {
+            color: "#99BBDD", // Lighter blue for non-highlighted countries
+            weight: 0.7,
+            opacity: 0.8,
+            fillOpacity: 0.08,
+            fillColor: "#D9E6F2"
+          }
+        }).addTo(map);
+      })
+      .catch(error => console.error("Error loading country borders:", error));
+    
+    // Create map legend
+    const legend = L.control({ position: 'topright' }) as any;
+    
+    legend.onAdd = function(map: L.Map) {
+      const div = L.DomUtil.create('div', 'info legend');
+      div.innerHTML = `
+        <div style="
+          background-color: white;
+          padding: 8px 12px;
+          border-radius: 4px;
+          margin-bottom: 10px;
+          box-shadow: 0 1px 5px rgba(0,0,0,0.2);
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          font-family: sans-serif;
+          font-size: 12px;
+        ">
+          <div style="font-weight: bold; margin-bottom: 4px;">Boliden Operations</div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="
+              width: 20px;
+              height: 20px;
+              background-color: #F59E0B;
+              border: 2px solid #333;
+              border-radius: 50%;
+              display: flex;
+              justify-content: center;
+              align-items: center;
+            ">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 3h20"/>
+                <path d="M21 6v6a6 6 0 0 1-6 6H9a6 6 0 0 1-6-6V6"/>
+                <path d="M12 10v6"/>
+                <path d="M12 3v3"/>
+              </svg>
+            </div>
+            <span>Mines</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="
+              width: 20px;
+              height: 20px;
+              background-color: #3B82F6;
+              border: 2px solid #333;
+              border-radius: 50%;
+              display: flex;
+              justify-content: center;
+              align-items: center;
+            ">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 12h2"/>
+                <path d="M6 12h2"/>
+                <path d="M10 12h2"/>
+                <path d="M22 12h-4"/>
+                <path d="M6 8h.01"/>
+                <path d="M10 8h.01"/>
+                <path d="M14 8h.01"/>
+                <path d="M18 8h.01"/>
+                <rect x="2" y="18" width="20" height="4" rx="1"/>
+                <path d="M4 15v3"/>
+                <path d="M8 15v3"/>
+                <path d="M12 15v3"/>
+                <path d="M16 15v3"/>
+                <path d="M20 15v3"/>
+                <path d="M4 8a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v4H4V8Z"/>
+              </svg>
+            </div>
+            <span>Smelters</span>
+          </div>
+        </div>
+      `;
+      return div;
+    };
+    
+    legend.addTo(map);
+    
+    // Add markers for each location
+    locationData.forEach(location => {
+      const icon = createIcon(location.category);
+      
+      const marker = L.marker([location.coordinates[0], location.coordinates[1]], { 
+        icon,
+        title: location.title,
+        alt: location.title,
+        riseOnHover: true
+      });
+      
+      // Add tooltip with detailed location info
+      marker.bindTooltip(`${location.title}<br>${location.location}`, {
+        direction: 'top',
+        offset: L.point(0, -12),
+        opacity: 0.9,
+        className: 'location-tooltip'
+      });
+      
+      // Store marker reference for later manipulation
+      markersRef.current[location.id] = marker;
+      
+      // Handle click events on markers
+      marker.on('click', () => {
+        if (gameState === 'playing') {
+          handleLocationClick(location);
+        } else {
+          setSelectedLocation(location);
+        }
+      });
+      
+      marker.addTo(map);
+    });
+    
+    // Custom zoom controls
+    const zoomControl = L.control({ position: 'bottomright' }) as any;
+    
+    zoomControl.onAdd = function(map: L.Map) {
+      const div = L.DomUtil.create('div', 'leaflet-control-zoom leaflet-bar leaflet-control');
+      
+      div.innerHTML = `
+        <a class="leaflet-control-zoom-in" href="#" title="Zoom in" role="button" aria-label="Zoom in">+</a>
+        <a class="leaflet-control-zoom-out" href="#" title="Zoom out" role="button" aria-label="Zoom out">−</a>
+      `;
+      
+      const zoomIn = div.querySelector('.leaflet-control-zoom-in');
+      const zoomOut = div.querySelector('.leaflet-control-zoom-out');
+      
+      if (zoomIn) {
+        zoomIn.addEventListener('click', (e) => {
+          e.preventDefault();
+          map.zoomIn();
+        });
+      }
+      
+      if (zoomOut) {
+        zoomOut.addEventListener('click', (e) => {
+          e.preventDefault();
+          map.zoomOut();
+        });
+      }
+      
+      return div;
+    };
+    
+    zoomControl.addTo(map);
+    
+    // Cleanup on unmount
+    return () => {
+      map.remove();
+    };
+  }, [createIcon, gameState, handleLocationClick]);
+  
+  return (
+    <div className="h-screen w-full bg-gray-100 relative">
+      <div className="h-full relative" ref={mapContainerRef}>
+        {/* Map header with title */}
+        <div className="absolute top-0 left-0 p-4 z-10 text-2xl font-bold text-gray-800">
+          Boliden Operations Map
+        </div>
+        
+        {/* Floating game panel - only shown when game is not playing */}
+        {gameState === 'idle' && (
+          <div className="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-50">
+            <div className="bg-white p-6 rounded-lg shadow-xl w-96">
+              <h2 className="text-2xl font-bold text-center mb-2">Explore Boliden Operations</h2>
+              <p className="text-gray-600 mb-4 text-center">Test your knowledge of Boliden's mines and smelters across Europe.</p>
+              
+              <div className="mb-4">
+                <div className="bg-blue-50 p-4 rounded-md text-sm">
+                  <h3 className="font-medium mb-2">How to Play:</h3>
+                  <ul className="list-disc pl-5 space-y-1">
+                    <li>You'll be asked to find specific Boliden operations on the map</li>
+                    <li>Click the correct location to earn points</li>
+                    <li>+1 point for correct answers, -1 for incorrect</li>
+                    <li>Game ends when all locations are found or score reaches -10</li>
+                  </ul>
+                </div>
+              </div>
+              
+              <div className="mb-4">
+                <div className="flex justify-between text-sm text-gray-600">
+                  <div>Total Locations: {locationData.length}</div>
+                  <div>Mines: {locationData.filter(l => l.category === 'mine').length}</div>
+                  <div>Smelters: {locationData.filter(l => l.category === 'smelter').length}</div>
+                </div>
+              </div>
+              
+              <button 
+                className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-medium"
+                onClick={startGame}
+              >
+                Start Game
+              </button>
+            </div>
+          </div>
+        )}
+        
+        {/* Game info panel - only shown during game */}
+        {gameState === 'playing' && currentTarget && (
+          <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-50">
+            <div className="bg-white p-3 rounded-lg shadow-md">
+              <div className="text-center mb-2">
+                <div className="text-sm text-gray-600">Find this location:</div>
+                <div className="text-xl font-bold" ref={targetNameRef} style={{ color: targetColorRef.current }}>{currentTarget.title}</div>
+              </div>
+              
+              <div className="flex justify-around text-sm">
+                <div>
+                  <span className="text-gray-600">Score:</span> <span className="font-bold" ref={scoreRef}>{score}</span>
+                </div>
+                <div>
+                  <span className="text-gray-600">Found:</span> <span className="font-bold" ref={foundCountRef}>{foundLocations.length}/{locationData.length}</span>
+                </div>
+                <div>
+                  <span className="text-gray-600">Time:</span> <span className="font-bold" ref={timerDisplayRef}>0:00</span>
+                </div>
+              </div>
+              <button 
+                className="mt-2 py-1 px-3 bg-red-600 hover:bg-red-700 text-white text-sm rounded-md font-medium"
+                onClick={endGame}
+              >
+                Exit Game
+              </button>
+            </div>
+          </div>
+        )}
+      
+      {/* Game finished panel */}
+      {gameState === 'finished' && gameStats && (
+        <div className="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-50">
+          <div className="bg-white p-6 rounded-lg shadow-xl w-96">
+            <h2 className="text-2xl font-bold text-center mb-4">Game Results</h2>
+            
+            <div className="mb-3">
+              <div className="text-center text-3xl font-bold text-blue-600 mb-1">
+                {gameStats.totalCorrect}/{locationData.length} ({gameStats.percentage}%)
+              </div>
+              <p className="text-center text-gray-600">
+                {gameStats.message}
+              </p>
+            </div>
+            
+            <div className="mb-3">
+              <div className="flex justify-between py-1 border-b">
+                <span>Total correct:</span>
+                <span className="font-medium">{gameStats.totalCorrect}</span>
+              </div>
+              <div className="flex justify-between py-1 border-b">
+                <span>Total attempts:</span>
+                <span className="font-medium">{gameStats.totalAttempts}</span>
+              </div>
+              <div className="flex justify-between py-1 border-b">
+                <span>Time:</span>
+                <span className="font-medium">{formatTime(gameStats.timeElapsed)}</span>
+              </div>
+            </div>
+            
+            <div className="flex gap-3">
+              <button 
+                className="flex-1 py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-medium"
+                onClick={() => setGameState('idle')}
+              >
+                Explore Map
+              </button>
+              <button 
+                className="flex-1 py-2 px-4 bg-green-600 hover:bg-green-700 text-white rounded-md font-medium"
+                onClick={startGame}
+              >
+                Play Again
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Location info panel */}
+      {gameState !== 'playing' && selectedLocation && (
+        <div className="absolute bottom-0 left-0 p-4 z-10 sm:max-w-md w-full">
+          <div className="bg-white p-4 rounded-lg shadow-md">
+            <div className="flex justify-between">
+              <h3 className="text-xl font-bold mb-2">{selectedLocation.title}</h3>
+              <button 
+                className="text-gray-400 hover:text-gray-600" 
+                onClick={() => setSelectedLocation(null)}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                </svg>
+              </button>
+            </div>
+            
+            <div className="text-sm mb-2 flex items-center text-gray-700">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clipRule="evenodd" />
+              </svg>
+              {selectedLocation.location}
+            </div>
+            
+            <div className="mb-2">
+              <div className="text-xs uppercase font-semibold text-gray-500 mb-1">Type</div>
+              <div className="flex items-center">
+                <div className={`w-3 h-3 rounded-full mr-2 ${selectedLocation.category === 'mine' ? 'bg-yellow-500' : 'bg-blue-500'}`}></div>
+                <span className="capitalize">{selectedLocation.category}</span>
+              </div>
+            </div>
+            
+            <div className="mb-2">
+              <div className="text-xs uppercase font-semibold text-gray-500 mb-1">Operating Since</div>
+              <div>{selectedLocation.startYear}</div>
+            </div>
+            
+            <div className="mb-3">
+              <div className="text-xs uppercase font-semibold text-gray-500 mb-1">Products</div>
+              <div className="flex flex-wrap gap-1">
+                {selectedLocation.products.map((product, index) => (
+                  <span 
+                    key={index} 
+                    className="inline-block bg-gray-100 px-2 py-1 rounded-md text-xs font-medium"
+                  >
+                    {product}
+                  </span>
+                ))}
+              </div>
+            </div>
+            
+            <div>
+              <div className="text-xs uppercase font-semibold text-gray-500 mb-1">About</div>
+              <p className="text-sm text-gray-700">{selectedLocation.details}</p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default MapExplorer;
